@@ -596,6 +596,167 @@ func TestTinyNumMethods(t *testing.T) {
 	}
 }
 
+// TestTypeMethodByName verifies that Type.Method and Type.MethodByName return
+// the correct metadata for concrete types — including that only exported
+// methods are reachable and that pointer-receiver methods are only in the
+// method set of *T.
+func TestTypeMethodByName(t *testing.T) {
+	vt := TypeOf(methodStruct{})
+	pt := TypeOf(&methodStruct{})
+
+	// Value type sees only the single exported value-receiver method.
+	if got := vt.NumMethod(); got != 1 {
+		t.Fatalf("methodStruct.NumMethod() = %d, want 1", got)
+	}
+	m0 := vt.Method(0)
+	if m0.Name != "ValueMethod1" {
+		t.Errorf("methodStruct.Method(0).Name = %q, want %q", m0.Name, "ValueMethod1")
+	}
+	if m0.PkgPath != "" {
+		t.Errorf("methodStruct.Method(0).PkgPath = %q, want \"\"", m0.PkgPath)
+	}
+	if m0.Index != 0 {
+		t.Errorf("methodStruct.Method(0).Index = %d, want 0", m0.Index)
+	}
+
+	if m, ok := vt.MethodByName("ValueMethod1"); !ok || m.Name != "ValueMethod1" {
+		t.Errorf(`vt.MethodByName("ValueMethod1") = (%+v, %v)`, m, ok)
+	}
+	// Pointer-receiver methods are NOT in the value type's method set.
+	if _, ok := vt.MethodByName("PointerMethod1"); ok {
+		t.Errorf(`vt.MethodByName("PointerMethod1") = ok, want missing`)
+	}
+	// Unexported methods are NOT surfaced via NumMethod/Method/MethodByName
+	// (they still exist for AssignableTo/Implements via the private list, but
+	// are hidden from the public reflect API to match Go's semantics).
+	if _, ok := vt.MethodByName("valueMethod2"); ok {
+		t.Errorf(`vt.MethodByName("valueMethod2") should be hidden`)
+	}
+	if _, ok := vt.MethodByName("DoesNotExist"); ok {
+		t.Errorf(`vt.MethodByName("DoesNotExist") should not be found`)
+	}
+
+	// Pointer type sees value methods (promoted) AND pointer methods.
+	if got := pt.NumMethod(); got != 3 {
+		t.Fatalf("(*methodStruct).NumMethod() = %d, want 3", got)
+	}
+	for _, name := range []string{"ValueMethod1", "PointerMethod1", "PointerMethod2"} {
+		m, ok := pt.MethodByName(name)
+		if !ok {
+			t.Errorf(`(*methodStruct).MethodByName(%q): not found`, name)
+			continue
+		}
+		if m.Name != name {
+			t.Errorf(`(*methodStruct).MethodByName(%q).Name = %q`, name, m.Name)
+		}
+	}
+	// Methods on pt must be walked in sorted order via Method(i).
+	for i := 0; i < pt.NumMethod(); i++ {
+		m := pt.Method(i)
+		if m.Index != i {
+			t.Errorf("(*methodStruct).Method(%d).Index = %d", i, m.Index)
+		}
+		if m.Name == "" {
+			t.Errorf("(*methodStruct).Method(%d).Name is empty", i)
+		}
+		if i > 0 {
+			prev := pt.Method(i - 1).Name
+			if prev >= m.Name {
+				t.Errorf("methods not in lexicographic order: %q >= %q", prev, m.Name)
+			}
+		}
+	}
+}
+
+// TestTypeMethodByNameNamed verifies MethodByName on a named non-struct type.
+func TestTypeMethodByNameNamed(t *testing.T) {
+	typ := TypeOf(MyStringer(0))
+	if got := typ.NumMethod(); got != 1 {
+		t.Fatalf("MyStringer.NumMethod() = %d, want 1", got)
+	}
+	m, ok := typ.MethodByName("String")
+	if !ok {
+		t.Fatalf(`MyStringer.MethodByName("String"): not found`)
+	}
+	if m.Name != "String" {
+		t.Errorf(`MyStringer.MethodByName("String").Name = %q`, m.Name)
+	}
+}
+
+// TestValueMethodByName verifies the primary fix for issue #3862: Value.Method
+// and Value.MethodByName no longer panic. A found method returns a valid
+// Value of Kind Func; an unknown name returns the zero Value.
+func TestValueMethodByName(t *testing.T) {
+	v := ValueOf(methodStruct{i: 42})
+
+	// No panic is the baseline requirement.
+	m := v.MethodByName("ValueMethod1")
+	if !m.IsValid() {
+		t.Fatalf(`MethodByName("ValueMethod1") returned invalid Value`)
+	}
+	if m.Kind() != Func {
+		t.Errorf(`MethodByName("ValueMethod1").Kind() = %v, want Func`, m.Kind())
+	}
+
+	if got := v.Method(0); !got.IsValid() {
+		t.Errorf(`Method(0) returned invalid Value`)
+	}
+
+	// Not found → zero Value, not a panic.
+	miss := v.MethodByName("DoesNotExist")
+	if miss.IsValid() {
+		t.Errorf(`MethodByName("DoesNotExist") should be invalid`)
+	}
+
+	// Unexported is hidden from Value.MethodByName too.
+	hidden := v.MethodByName("valueMethod2")
+	if hidden.IsValid() {
+		t.Errorf(`MethodByName("valueMethod2") should be hidden`)
+	}
+
+	// Bound method values are never nil and never zero, matching Go's
+	// semantics. These used to reinterpret the receiver data as a
+	// funcHeader; the valueFlagMethod guard prevents that.
+	if m.IsNil() {
+		t.Errorf(`MethodByName("ValueMethod1").IsNil() = true, want false`)
+	}
+	if m.IsZero() {
+		t.Errorf(`MethodByName("ValueMethod1").IsZero() = true, want false`)
+	}
+}
+
+// TestTypeMethodOnInterface covers MethodByName on an interface type — Go's
+// reflect includes unexported methods in an interface's method set, unlike
+// concrete types, so this path has a separate code branch.
+type ifaceWithPrivate interface {
+	Public() int
+	private() int //nolint:unused
+}
+
+func TestTypeMethodOnInterface(t *testing.T) {
+	typ := TypeOf((*ifaceWithPrivate)(nil)).Elem()
+	if got := typ.NumMethod(); got != 2 {
+		t.Fatalf("interface NumMethod() = %d, want 2 (Public and private)", got)
+	}
+	m, ok := typ.MethodByName("Public")
+	if !ok {
+		t.Fatalf(`interface MethodByName("Public") not found`)
+	}
+	if m.Name != "Public" {
+		t.Errorf(`interface MethodByName("Public").Name = %q`, m.Name)
+	}
+	// Interface method entries expose a nil methodType in the list; reflect
+	// reports Method.Type as a nil Type (Method.Func is also nil) for
+	// interfaces, matching stdlib conventions.
+	m2, ok := typ.MethodByName("private")
+	if !ok {
+		t.Fatalf(`interface MethodByName("private") should be visible on interface types`)
+	}
+	if m2.Name != "private" {
+		t.Errorf(`interface MethodByName("private").Name = %q`, m2.Name)
+	}
+}
+
 func TestAssignableTo(t *testing.T) {
 	var a any
 	refa := ValueOf(&a).Elem()
@@ -625,6 +786,187 @@ func TestAssignableTo(t *testing.T) {
 	refd.Set(ValueOf(bstr{0x02, 0x03}))
 	if got, want := refb.Interface().([]byte), []byte{0x02, 0x03}; !bytes.Equal(got, want) {
 		t.Errorf("AssignableTo / Set failed, got %v, want %v", got, want)
+	}
+}
+
+// The following tests mirror the Go standard library's TestImplements and
+// TestAssignableTo from reflect/set_test.go, restricted to the types available
+// in TinyGo's testable subset.
+
+type assignableReader interface {
+	Read(p []byte) (int, error)
+}
+
+type assignableReadWriter interface {
+	Read(p []byte) (int, error)
+	Write(p []byte) (int, error)
+}
+
+type assignableStringer interface {
+	String() string
+}
+
+// assignablePtrReader satisfies assignableReader only via pointer receiver.
+type assignablePtrReader struct{}
+
+func (*assignablePtrReader) Read(p []byte) (int, error) { return 0, nil }
+
+// assignableValReader satisfies assignableReader via value receiver (so both
+// T and *T satisfy it).
+type assignableValReader struct{}
+
+func (assignableValReader) Read(p []byte) (int, error) { return 0, nil }
+
+// assignableReadWriterImpl satisfies the superset interface.
+type assignableReadWriterImpl struct{}
+
+func (assignableReadWriterImpl) Read(p []byte) (int, error)  { return 0, nil }
+func (assignableReadWriterImpl) Write(p []byte) (int, error) { return 0, nil }
+
+// assignableWrongSig has a Read method with a signature that does not match
+// assignableReader.Read.
+type assignableWrongSig struct{}
+
+func (assignableWrongSig) Read() {}
+
+var assignableReaderType = TypeOf((*assignableReader)(nil)).Elem()
+var assignableReadWriterType = TypeOf((*assignableReadWriter)(nil)).Elem()
+var assignableStringerType = TypeOf((*assignableStringer)(nil)).Elem()
+var assignableEmptyType = TypeOf((*any)(nil)).Elem()
+
+var implementsTests = []struct {
+	x    any
+	t    Type
+	want bool
+	desc string
+}{
+	// Value receiver: both T and *T satisfy the interface.
+	{assignableValReader{}, assignableReaderType, true, "valReader implements Reader"},
+	{&assignableValReader{}, assignableReaderType, true, "*valReader implements Reader"},
+
+	// Pointer receiver: only *T satisfies the interface.
+	{assignablePtrReader{}, assignableReaderType, false, "ptrReader does not implement Reader"},
+	{&assignablePtrReader{}, assignableReaderType, true, "*ptrReader implements Reader"},
+
+	// Missing method.
+	{assignableValReader{}, assignableReadWriterType, false, "valReader missing Write"},
+	{assignableReadWriterImpl{}, assignableReadWriterType, true, "readWriter implements ReadWriter"},
+
+	// Superset implements subset.
+	{assignableReadWriterImpl{}, assignableReaderType, true, "readWriter implements Reader"},
+
+	// Wrong signature.
+	{assignableWrongSig{}, assignableReaderType, false, "wrong signature does not implement"},
+
+	// Empty interface is implemented by anything.
+	{assignableValReader{}, assignableEmptyType, true, "valReader implements any"},
+	{42, assignableEmptyType, true, "int implements any"},
+
+	// Anything with a String() string method implements Stringer, including
+	// named basic types.
+	{MyStringer(0), assignableStringerType, true, "MyStringer implements Stringer"},
+}
+
+// MyStringer is a named basic type with a String() method; used to verify
+// that non-struct kinds work with Implements/AssignableTo.
+type MyStringer int
+
+func (MyStringer) String() string { return "MyStringer" }
+
+func TestImplementsInterface(t *testing.T) {
+	for _, tt := range implementsTests {
+		got := TypeOf(tt.x).Implements(tt.t)
+		if got != tt.want {
+			t.Errorf("%s: TypeOf(%T).Implements(%s) = %v, want %v",
+				tt.desc, tt.x, tt.t, got, tt.want)
+		}
+	}
+}
+
+// TestImplementsNonInterfaceArg verifies that Type.Implements panics when
+// passed a non-interface type, matching Go's standard library behavior.
+func TestImplementsNonInterfaceArg(t *testing.T) {
+	if runtime.GOARCH == "wasm" {
+		t.Log("recover not supported")
+		return
+	}
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Errorf("Implements(non-interface) did not panic")
+		}
+	}()
+	TypeOf(42).Implements(TypeOf(42))
+}
+
+func TestAssignableToInterface(t *testing.T) {
+	// Reuse implementsTests: anything that Implements an interface is also
+	// AssignableTo it.
+	for _, tt := range implementsTests {
+		got := TypeOf(tt.x).AssignableTo(tt.t)
+		if got != tt.want {
+			t.Errorf("%s: TypeOf(%T).AssignableTo(%s) = %v, want %v",
+				tt.desc, tt.x, tt.t, got, tt.want)
+		}
+	}
+}
+
+// TestAssignableToInterfaceToInterface verifies that a larger interface is
+// assignable to a smaller interface it contains, and vice versa is not.
+func TestAssignableToInterfaceToInterface(t *testing.T) {
+	if !assignableReadWriterType.AssignableTo(assignableReaderType) {
+		t.Errorf("ReadWriter should be AssignableTo Reader")
+	}
+	if !assignableReadWriterType.Implements(assignableReaderType) {
+		t.Errorf("ReadWriter should Implement Reader")
+	}
+	if assignableReaderType.AssignableTo(assignableReadWriterType) {
+		t.Errorf("Reader should not be AssignableTo ReadWriter")
+	}
+	if assignableReaderType.Implements(assignableReadWriterType) {
+		t.Errorf("Reader should not Implement ReadWriter")
+	}
+}
+
+// assignablePrivate has an unexported method declared inside this test
+// package. A concrete type defined here implements it; a type from a different
+// package with a method of the same name must not. This mirrors the
+// package-path rules for unexported methods in Go's assignability spec.
+type assignablePrivate interface {
+	privateMethod()
+}
+
+type assignablePrivateImpl struct{}
+
+func (assignablePrivateImpl) privateMethod() {}
+
+// TestImplementsUnexportedMethod verifies that unexported method matching
+// respects the package path. Two methods with the same name in different
+// packages must not match, otherwise Implements would yield false positives.
+func TestImplementsUnexportedMethod(t *testing.T) {
+	privateType := TypeOf((*assignablePrivate)(nil)).Elem()
+	if !TypeOf(assignablePrivateImpl{}).Implements(privateType) {
+		t.Errorf("assignablePrivateImpl should Implement assignablePrivate")
+	}
+	// A type with no methods at all cannot implement an interface with an
+	// unexported method.
+	if TypeOf(42).Implements(privateType) {
+		t.Errorf("int should not Implement an interface with a private method")
+	}
+}
+
+// TestImplementsPointerReceiverInheritance verifies that a pointer type
+// inherits its underlying value receiver's methods, so *T implements an
+// interface when T does.
+func TestImplementsPointerReceiverInheritance(t *testing.T) {
+	if !TypeOf(&assignableValReader{}).Implements(assignableReaderType) {
+		t.Errorf("*assignableValReader should Implement Reader (inherits value receiver)")
+	}
+	if !TypeOf(MyStringer(0)).Implements(assignableStringerType) {
+		t.Errorf("MyStringer should Implement Stringer")
+	}
+	if !TypeOf(new(MyStringer)).Implements(assignableStringerType) {
+		t.Errorf("*MyStringer should Implement Stringer (inherits value receiver)")
 	}
 }
 

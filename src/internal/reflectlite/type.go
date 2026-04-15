@@ -175,12 +175,13 @@ type ptrType struct {
 	RawType
 	numMethod uint16
 	elem      *RawType
+	methods   *methodList
 }
 
 type interfaceType struct {
 	RawType
-	ptrTo *RawType
-	// TODO: methods
+	ptrTo   *RawType
+	methods *methodList
 }
 
 type arrayType struct {
@@ -206,6 +207,7 @@ type namedType struct {
 	ptrTo     *RawType
 	elem      *RawType
 	pkg       *byte
+	methods   *methodList
 	name      [1]byte
 }
 
@@ -221,6 +223,7 @@ type structType struct {
 	numMethod uint16
 	ptrTo     *RawType
 	pkgpath   *byte
+	methods   *methodList
 	size      uint32
 	numField  uint16
 	fields    [1]structField // the remaining fields are all of type structField
@@ -229,6 +232,72 @@ type structType struct {
 type structField struct {
 	fieldType *RawType
 	data      unsafe.Pointer // various bits of information, packed in a byte array
+}
+
+// methodListEntry mirrors one entry in the per-type method list global
+// emitted by the compiler's getTypeMethodsList. The signature pointer is a
+// unique identity for the method (encoding name, parameter types, return
+// types and — for unexported methods — package path; two methods match if
+// and only if their signature pointers are identical). The content of the
+// signature global is the null-terminated method name, making the name
+// recoverable at runtime. methodType points to a Func-kind type descriptor
+// for the method's function signature, or nil for interface methods.
+type methodListEntry struct {
+	signature  unsafe.Pointer
+	methodType *RawType
+}
+
+// methodList is the layout of the per-type global emitted by the compiler's
+// getTypeMethodsList.
+type methodList struct {
+	numMethod uint16
+	entries   [1]methodListEntry
+}
+
+// methods returns the list of method entries for this type. Types without
+// methods return nil.
+func (t *RawType) methodList() *methodList {
+	if tag := t.ptrtag(); tag != 0 {
+		// Tagged pointers (**T, ***T, ...) have no attached reflection
+		// metadata.
+		return nil
+	}
+	if t.isNamed() {
+		return (*namedType)(unsafe.Pointer(t)).methods
+	}
+	switch t.Kind() {
+	case Pointer:
+		return (*ptrType)(unsafe.Pointer(t)).methods
+	case Struct:
+		return (*structType)(unsafe.Pointer(t)).methods
+	case Interface:
+		return (*interfaceType)(unsafe.Pointer(t)).methods
+	}
+	return nil
+}
+
+// entryAt returns a pointer to the i'th entry in the list. The [1] in the
+// declaration is a placeholder to satisfy the Go type checker; the real
+// array is as long as numMethod.
+func (m *methodList) entryAt(i int) *methodListEntry {
+	return (*methodListEntry)(unsafe.Add(unsafe.Pointer(&m.entries[0]), uintptr(i)*unsafe.Sizeof(m.entries[0])))
+}
+
+// methodAt returns the signature pointer for the i'th method in the list.
+func (m *methodList) methodAt(i int) unsafe.Pointer {
+	return m.entryAt(i).signature
+}
+
+// methodNameAt returns the name of the i'th method by reading the
+// null-terminated string at the signature global.
+func (m *methodList) methodNameAt(i int) string {
+	return readStringZ(m.entryAt(i).signature)
+}
+
+// methodTypeAt returns the type descriptor of the i'th method's function
+// signature, or nil for interface methods.
+func (m *methodList) methodTypeAt(i int) *RawType {
+	return m.entryAt(i).methodType
 }
 
 // Equivalent to (go/types.Type).Underlying(): if this is a named type return
@@ -733,20 +802,17 @@ func (t *RawType) FieldAlign() int {
 // AssignableTo returns whether a value of type t can be assigned to a variable
 // of type u.
 func (t *RawType) AssignableTo(u Type) bool {
-	if t == u.(*RawType) {
+	uu := u.(*RawType)
+	if t == uu {
 		return true
 	}
 
-	if t.underlying() == u.(*RawType).underlying() && (!t.isNamed() || !u.(*RawType).isNamed()) {
+	if t.underlying() == uu.underlying() && (!t.isNamed() || !uu.isNamed()) {
 		return true
 	}
 
-	if u.Kind() == Interface && u.NumMethod() == 0 {
-		return true
-	}
-
-	if u.Kind() == Interface {
-		panic("reflect: unimplemented: AssignableTo with interface")
+	if uu.Kind() == Interface {
+		return implements(uu, t)
 	}
 	return false
 }
@@ -755,7 +821,40 @@ func (t *RawType) Implements(u Type) bool {
 	if u.Kind() != Interface {
 		panic("reflect: non-interface type passed to Type.Implements")
 	}
-	return t.AssignableTo(u)
+	return implements(u.(*RawType), t)
+}
+
+// implements reports whether the type v implements the interface type iface.
+// Both arguments must be non-nil and iface must be of kind Interface.
+func implements(iface, v *RawType) bool {
+	ifaceMethods := iface.methodList()
+	if ifaceMethods == nil || ifaceMethods.numMethod == 0 {
+		// Empty interface: satisfied by any type.
+		return true
+	}
+	vMethods := v.methodList()
+	if vMethods == nil {
+		return false
+	}
+	// Each interface method's signature pointer must be present in v's
+	// method list. Method signature globals are deduplicated per
+	// (name, parameter types, return types) tuple — and include the package
+	// path for unexported methods — so pointer equality is equivalent to
+	// matching name+signature by Go's assignability rules.
+	for i := 0; i < int(ifaceMethods.numMethod); i++ {
+		want := ifaceMethods.methodAt(i)
+		found := false
+		for j := 0; j < int(vMethods.numMethod); j++ {
+			if vMethods.methodAt(j) == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 // Comparable returns whether values of this type can be compared to each other.
@@ -791,12 +890,138 @@ func (t *RawType) NumMethod() int {
 	case Struct:
 		return int((*structType)(unsafe.Pointer(t)).numMethod)
 	case Interface:
-		//FIXME: Use len(methods)
-		return (*interfaceType)(unsafe.Pointer(t)).ptrTo.NumMethod()
+		// For interfaces, NumMethod returns the number of both exported and
+		// unexported methods. The methodList numMethod matches this.
+		if ml := t.methodList(); ml != nil {
+			return int(ml.numMethod)
+		}
+		return 0
 	}
 
 	// Other types have no methods attached.  Note we don't panic here.
 	return 0
+}
+
+// RawMethod is reflectlite's low-level view of a single method. The public
+// reflect.Method type carries additional Type/Value conveniences that are
+// assembled by the reflect package on top of these raw fields.
+type RawMethod struct {
+	Name       string
+	PkgPath    string
+	MethodType *RawType // Func-kind type descriptor for the method signature; nil for interface methods
+	Index      int
+}
+
+// isExportedFirst reports whether the first rune of name is an ASCII capital.
+// Method names in TinyGo's method lists originate from Go identifiers so this
+// is sufficient — non-ASCII exported names (e.g. "ΦExported") go through the
+// same rule as in Go's token.IsExported, which also accepts any Unicode
+// uppercase first rune, but in practice method-set dispatch uses ASCII.
+func isExportedFirst(name string) bool {
+	if len(name) == 0 {
+		return false
+	}
+	c := name[0]
+	return 'A' <= c && c <= 'Z'
+}
+
+// RawMethodAt returns the i'th method in the public method set of t. For
+// non-interface types this skips unexported methods so i indexes the same
+// sequence as NumMethod reports. For interface types all methods are
+// included (matching Go's NumMethod semantics for interfaces).
+//
+// Returns ok=false if i is out of range. Methods are returned in the order
+// they appear in the compiler-emitted method list, which for non-interface
+// types is the lexicographic order produced by x/tools' MethodSet.
+func (t *RawType) RawMethodAt(i int) (RawMethod, bool) {
+	if i < 0 {
+		return RawMethod{}, false
+	}
+	ml := t.methodList()
+	if ml == nil {
+		return RawMethod{}, false
+	}
+	isIface := t.Kind() == Interface
+	pkgpath := t.methodPkgPath()
+	seen := 0
+	for j := 0; j < int(ml.numMethod); j++ {
+		name := ml.methodNameAt(j)
+		if !isIface && !isExportedFirst(name) {
+			continue
+		}
+		if seen == i {
+			rm := RawMethod{
+				Name:       name,
+				MethodType: ml.methodTypeAt(j),
+				Index:      i,
+			}
+			if !isExportedFirst(name) {
+				rm.PkgPath = pkgpath
+			}
+			return rm, true
+		}
+		seen++
+	}
+	return RawMethod{}, false
+}
+
+// RawMethodByName looks up a method by name in the public method set of t.
+// Returns ok=false if no matching method exists.
+func (t *RawType) RawMethodByName(name string) (RawMethod, bool) {
+	ml := t.methodList()
+	if ml == nil {
+		return RawMethod{}, false
+	}
+	isIface := t.Kind() == Interface
+	// Unexported names are only looked up for interface types; concrete
+	// types hide them from the public reflect API.
+	if !isIface && !isExportedFirst(name) {
+		return RawMethod{}, false
+	}
+	pkgpath := t.methodPkgPath()
+	publicIndex := 0
+	for j := 0; j < int(ml.numMethod); j++ {
+		got := ml.methodNameAt(j)
+		if !isIface && !isExportedFirst(got) {
+			continue
+		}
+		if got == name {
+			rm := RawMethod{
+				Name:       got,
+				MethodType: ml.methodTypeAt(j),
+				Index:      publicIndex,
+			}
+			if !isExportedFirst(got) {
+				rm.PkgPath = pkgpath
+			}
+			return rm, true
+		}
+		publicIndex++
+	}
+	return RawMethod{}, false
+}
+
+// methodPkgPath returns the package path used for qualifying unexported
+// method names in this type's method set. Named types use their own package.
+// Pointer-to-named inherits from the pointee. Unnamed struct types use the
+// pkgpath encoded in the struct type descriptor. Other kinds have no
+// natural package and return the empty string.
+func (t *RawType) methodPkgPath() string {
+	if t.isNamed() {
+		return t.PkgPath()
+	}
+	switch t.Kind() {
+	case Pointer:
+		elem := (*ptrType)(unsafe.Pointer(t)).elem
+		if elem != nil {
+			return elem.methodPkgPath()
+		}
+	case Struct:
+		if p := (*structType)(unsafe.Pointer(t)).pkgpath; p != nil {
+			return readStringZ(unsafe.Pointer(p))
+		}
+	}
+	return ""
 }
 
 // Read and return a null terminated string starting from data.
