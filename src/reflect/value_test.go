@@ -628,6 +628,187 @@ func TestAssignableTo(t *testing.T) {
 	}
 }
 
+// The following tests mirror the Go standard library's TestImplements and
+// TestAssignableTo from reflect/set_test.go, restricted to the types available
+// in TinyGo's testable subset.
+
+type assignableReader interface {
+	Read(p []byte) (int, error)
+}
+
+type assignableReadWriter interface {
+	Read(p []byte) (int, error)
+	Write(p []byte) (int, error)
+}
+
+type assignableStringer interface {
+	String() string
+}
+
+// assignablePtrReader satisfies assignableReader only via pointer receiver.
+type assignablePtrReader struct{}
+
+func (*assignablePtrReader) Read(p []byte) (int, error) { return 0, nil }
+
+// assignableValReader satisfies assignableReader via value receiver (so both
+// T and *T satisfy it).
+type assignableValReader struct{}
+
+func (assignableValReader) Read(p []byte) (int, error) { return 0, nil }
+
+// assignableReadWriterImpl satisfies the superset interface.
+type assignableReadWriterImpl struct{}
+
+func (assignableReadWriterImpl) Read(p []byte) (int, error)  { return 0, nil }
+func (assignableReadWriterImpl) Write(p []byte) (int, error) { return 0, nil }
+
+// assignableWrongSig has a Read method with a signature that does not match
+// assignableReader.Read.
+type assignableWrongSig struct{}
+
+func (assignableWrongSig) Read() {}
+
+var assignableReaderType = TypeOf((*assignableReader)(nil)).Elem()
+var assignableReadWriterType = TypeOf((*assignableReadWriter)(nil)).Elem()
+var assignableStringerType = TypeOf((*assignableStringer)(nil)).Elem()
+var assignableEmptyType = TypeOf((*any)(nil)).Elem()
+
+var implementsTests = []struct {
+	x    any
+	t    Type
+	want bool
+	desc string
+}{
+	// Value receiver: both T and *T satisfy the interface.
+	{assignableValReader{}, assignableReaderType, true, "valReader implements Reader"},
+	{&assignableValReader{}, assignableReaderType, true, "*valReader implements Reader"},
+
+	// Pointer receiver: only *T satisfies the interface.
+	{assignablePtrReader{}, assignableReaderType, false, "ptrReader does not implement Reader"},
+	{&assignablePtrReader{}, assignableReaderType, true, "*ptrReader implements Reader"},
+
+	// Missing method.
+	{assignableValReader{}, assignableReadWriterType, false, "valReader missing Write"},
+	{assignableReadWriterImpl{}, assignableReadWriterType, true, "readWriter implements ReadWriter"},
+
+	// Superset implements subset.
+	{assignableReadWriterImpl{}, assignableReaderType, true, "readWriter implements Reader"},
+
+	// Wrong signature.
+	{assignableWrongSig{}, assignableReaderType, false, "wrong signature does not implement"},
+
+	// Empty interface is implemented by anything.
+	{assignableValReader{}, assignableEmptyType, true, "valReader implements any"},
+	{42, assignableEmptyType, true, "int implements any"},
+
+	// Anything with a String() string method implements Stringer, including
+	// named basic types.
+	{MyStringer(0), assignableStringerType, true, "MyStringer implements Stringer"},
+}
+
+// MyStringer is a named basic type with a String() method; used to verify
+// that non-struct kinds work with Implements/AssignableTo.
+type MyStringer int
+
+func (MyStringer) String() string { return "MyStringer" }
+
+func TestImplementsInterface(t *testing.T) {
+	for _, tt := range implementsTests {
+		got := TypeOf(tt.x).Implements(tt.t)
+		if got != tt.want {
+			t.Errorf("%s: TypeOf(%T).Implements(%s) = %v, want %v",
+				tt.desc, tt.x, tt.t, got, tt.want)
+		}
+	}
+}
+
+// TestImplementsNonInterfaceArg verifies that Type.Implements panics when
+// passed a non-interface type, matching Go's standard library behavior.
+func TestImplementsNonInterfaceArg(t *testing.T) {
+	if runtime.GOARCH == "wasm" {
+		t.Log("recover not supported")
+		return
+	}
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Errorf("Implements(non-interface) did not panic")
+		}
+	}()
+	TypeOf(42).Implements(TypeOf(42))
+}
+
+func TestAssignableToInterface(t *testing.T) {
+	// Reuse implementsTests: anything that Implements an interface is also
+	// AssignableTo it.
+	for _, tt := range implementsTests {
+		got := TypeOf(tt.x).AssignableTo(tt.t)
+		if got != tt.want {
+			t.Errorf("%s: TypeOf(%T).AssignableTo(%s) = %v, want %v",
+				tt.desc, tt.x, tt.t, got, tt.want)
+		}
+	}
+}
+
+// TestAssignableToInterfaceToInterface verifies that a larger interface is
+// assignable to a smaller interface it contains, and vice versa is not.
+func TestAssignableToInterfaceToInterface(t *testing.T) {
+	if !assignableReadWriterType.AssignableTo(assignableReaderType) {
+		t.Errorf("ReadWriter should be AssignableTo Reader")
+	}
+	if !assignableReadWriterType.Implements(assignableReaderType) {
+		t.Errorf("ReadWriter should Implement Reader")
+	}
+	if assignableReaderType.AssignableTo(assignableReadWriterType) {
+		t.Errorf("Reader should not be AssignableTo ReadWriter")
+	}
+	if assignableReaderType.Implements(assignableReadWriterType) {
+		t.Errorf("Reader should not Implement ReadWriter")
+	}
+}
+
+// assignablePrivate has an unexported method declared inside this test
+// package. A concrete type defined here implements it; a type from a different
+// package with a method of the same name must not. This mirrors the
+// package-path rules for unexported methods in Go's assignability spec.
+type assignablePrivate interface {
+	privateMethod()
+}
+
+type assignablePrivateImpl struct{}
+
+func (assignablePrivateImpl) privateMethod() {}
+
+// TestImplementsUnexportedMethod verifies that unexported method matching
+// respects the package path. Two methods with the same name in different
+// packages must not match, otherwise Implements would yield false positives.
+func TestImplementsUnexportedMethod(t *testing.T) {
+	privateType := TypeOf((*assignablePrivate)(nil)).Elem()
+	if !TypeOf(assignablePrivateImpl{}).Implements(privateType) {
+		t.Errorf("assignablePrivateImpl should Implement assignablePrivate")
+	}
+	// A type with no methods at all cannot implement an interface with an
+	// unexported method.
+	if TypeOf(42).Implements(privateType) {
+		t.Errorf("int should not Implement an interface with a private method")
+	}
+}
+
+// TestImplementsPointerReceiverInheritance verifies that a pointer type
+// inherits its underlying value receiver's methods, so *T implements an
+// interface when T does.
+func TestImplementsPointerReceiverInheritance(t *testing.T) {
+	if !TypeOf(&assignableValReader{}).Implements(assignableReaderType) {
+		t.Errorf("*assignableValReader should Implement Reader (inherits value receiver)")
+	}
+	if !TypeOf(MyStringer(0)).Implements(assignableStringerType) {
+		t.Errorf("MyStringer should Implement Stringer")
+	}
+	if !TypeOf(new(MyStringer)).Implements(assignableStringerType) {
+		t.Errorf("*MyStringer should Implement Stringer (inherits value receiver)")
+	}
+}
+
 func TestConvert(t *testing.T) {
 	v := ValueOf(int64(3))
 	c := v.Convert(TypeOf(byte(0)))

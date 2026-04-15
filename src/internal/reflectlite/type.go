@@ -175,12 +175,13 @@ type ptrType struct {
 	RawType
 	numMethod uint16
 	elem      *RawType
+	methods   *methodList
 }
 
 type interfaceType struct {
 	RawType
-	ptrTo *RawType
-	// TODO: methods
+	ptrTo   *RawType
+	methods *methodList
 }
 
 type arrayType struct {
@@ -206,6 +207,7 @@ type namedType struct {
 	ptrTo     *RawType
 	elem      *RawType
 	pkg       *byte
+	methods   *methodList
 	name      [1]byte
 }
 
@@ -221,6 +223,7 @@ type structType struct {
 	numMethod uint16
 	ptrTo     *RawType
 	pkgpath   *byte
+	methods   *methodList
 	size      uint32
 	numField  uint16
 	fields    [1]structField // the remaining fields are all of type structField
@@ -229,6 +232,46 @@ type structType struct {
 type structField struct {
 	fieldType *RawType
 	data      unsafe.Pointer // various bits of information, packed in a byte array
+}
+
+// methodList is the layout of the per-type global emitted by the compiler's
+// getTypeMethodsList. Each entry is a pointer to a shared method signature
+// global: two methods match if and only if their signature pointers are
+// identical (this encodes name, types and — for unexported methods — package
+// path in a single comparison).
+type methodList struct {
+	numMethod uint16
+	signature [1]unsafe.Pointer
+}
+
+// methods returns the list of method signature pointers for this type. Types
+// without methods return nil.
+func (t *RawType) methodList() *methodList {
+	if tag := t.ptrtag(); tag != 0 {
+		// Tagged pointers (**T, ***T, ...) have no attached reflection
+		// metadata.
+		return nil
+	}
+	if t.isNamed() {
+		return (*namedType)(unsafe.Pointer(t)).methods
+	}
+	switch t.Kind() {
+	case Pointer:
+		return (*ptrType)(unsafe.Pointer(t)).methods
+	case Struct:
+		return (*structType)(unsafe.Pointer(t)).methods
+	case Interface:
+		return (*interfaceType)(unsafe.Pointer(t)).methods
+	}
+	return nil
+}
+
+// methodAt returns the signature pointer for the i'th method in the list.
+func (m *methodList) methodAt(i int) unsafe.Pointer {
+	// The signature array lives directly after numMethod in memory, with its
+	// length determined by numMethod. The [1] in the declaration is a
+	// placeholder to satisfy the Go type checker.
+	return *(*unsafe.Pointer)(unsafe.Add(unsafe.Pointer(&m.signature[0]), uintptr(i)*unsafe.Sizeof(m.signature[0])))
 }
 
 // Equivalent to (go/types.Type).Underlying(): if this is a named type return
@@ -733,20 +776,17 @@ func (t *RawType) FieldAlign() int {
 // AssignableTo returns whether a value of type t can be assigned to a variable
 // of type u.
 func (t *RawType) AssignableTo(u Type) bool {
-	if t == u.(*RawType) {
+	uu := u.(*RawType)
+	if t == uu {
 		return true
 	}
 
-	if t.underlying() == u.(*RawType).underlying() && (!t.isNamed() || !u.(*RawType).isNamed()) {
+	if t.underlying() == uu.underlying() && (!t.isNamed() || !uu.isNamed()) {
 		return true
 	}
 
-	if u.Kind() == Interface && u.NumMethod() == 0 {
-		return true
-	}
-
-	if u.Kind() == Interface {
-		panic("reflect: unimplemented: AssignableTo with interface")
+	if uu.Kind() == Interface {
+		return implements(uu, t)
 	}
 	return false
 }
@@ -755,7 +795,40 @@ func (t *RawType) Implements(u Type) bool {
 	if u.Kind() != Interface {
 		panic("reflect: non-interface type passed to Type.Implements")
 	}
-	return t.AssignableTo(u)
+	return implements(u.(*RawType), t)
+}
+
+// implements reports whether the type v implements the interface type iface.
+// Both arguments must be non-nil and iface must be of kind Interface.
+func implements(iface, v *RawType) bool {
+	ifaceMethods := iface.methodList()
+	if ifaceMethods == nil || ifaceMethods.numMethod == 0 {
+		// Empty interface: satisfied by any type.
+		return true
+	}
+	vMethods := v.methodList()
+	if vMethods == nil {
+		return false
+	}
+	// Each interface method's signature pointer must be present in v's
+	// method list. Method signature globals are deduplicated per
+	// (name, parameter types, return types) tuple — and include the package
+	// path for unexported methods — so pointer equality is equivalent to
+	// matching name+signature by Go's assignability rules.
+	for i := 0; i < int(ifaceMethods.numMethod); i++ {
+		want := ifaceMethods.methodAt(i)
+		found := false
+		for j := 0; j < int(vMethods.numMethod); j++ {
+			if vMethods.methodAt(j) == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
 }
 
 // Comparable returns whether values of this type can be compared to each other.

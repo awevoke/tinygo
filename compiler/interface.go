@@ -199,6 +199,7 @@ func (c *compilerContext) getTypeCode(typ types.Type) llvm.Value {
 				types.NewVar(token.NoPos, nil, "ptrTo", types.Typ[types.UnsafePointer]),
 				types.NewVar(token.NoPos, nil, "underlying", types.Typ[types.UnsafePointer]),
 				types.NewVar(token.NoPos, nil, "pkgpath", types.Typ[types.UnsafePointer]),
+				types.NewVar(token.NoPos, nil, "methods", types.Typ[types.UnsafePointer]),
 				types.NewVar(token.NoPos, nil, "name", types.NewArray(types.Typ[types.Int8], int64(len(pkgname)+1+len(name)+1))),
 			)
 		case *types.Chan:
@@ -217,6 +218,7 @@ func (c *compilerContext) getTypeCode(typ types.Type) llvm.Value {
 			typeFieldTypes = append(typeFieldTypes,
 				types.NewVar(token.NoPos, nil, "numMethods", types.Typ[types.Uint16]),
 				types.NewVar(token.NoPos, nil, "elementType", types.Typ[types.UnsafePointer]),
+				types.NewVar(token.NoPos, nil, "methods", types.Typ[types.UnsafePointer]),
 			)
 		case *types.Array:
 			typeFieldTypes = append(typeFieldTypes,
@@ -238,6 +240,7 @@ func (c *compilerContext) getTypeCode(typ types.Type) llvm.Value {
 				types.NewVar(token.NoPos, nil, "numMethods", types.Typ[types.Uint16]),
 				types.NewVar(token.NoPos, nil, "ptrTo", types.Typ[types.UnsafePointer]),
 				types.NewVar(token.NoPos, nil, "pkgpath", types.Typ[types.UnsafePointer]),
+				types.NewVar(token.NoPos, nil, "methods", types.Typ[types.UnsafePointer]),
 				types.NewVar(token.NoPos, nil, "size", types.Typ[types.Uint32]),
 				types.NewVar(token.NoPos, nil, "numFields", types.Typ[types.Uint16]),
 				types.NewVar(token.NoPos, nil, "fields", types.NewArray(c.getRuntimeType("structField"), int64(typ.NumFields()))),
@@ -245,8 +248,8 @@ func (c *compilerContext) getTypeCode(typ types.Type) llvm.Value {
 		case *types.Interface:
 			typeFieldTypes = append(typeFieldTypes,
 				types.NewVar(token.NoPos, nil, "ptrTo", types.Typ[types.UnsafePointer]),
+				types.NewVar(token.NoPos, nil, "methods", types.Typ[types.UnsafePointer]),
 			)
-			// TODO: methods
 		case *types.Signature:
 			typeFieldTypes = append(typeFieldTypes,
 				types.NewVar(token.NoPos, nil, "ptrTo", types.Typ[types.UnsafePointer]),
@@ -297,6 +300,7 @@ func (c *compilerContext) getTypeCode(typ types.Type) llvm.Value {
 				c.getTypeCode(types.NewPointer(typ)),                        // ptrTo
 				c.getTypeCode(typ.Underlying()),                             // underlying
 				pkgPathPtr,                                                  // pkgpath pointer
+				c.getTypeMethodsListPtr(typ),                                // methods
 				c.ctx.ConstString(pkgname+"."+name+"\x00", false),           // name
 			}
 			metabyte |= 1 << 5 // "named" flag
@@ -325,7 +329,8 @@ func (c *compilerContext) getTypeCode(typ types.Type) llvm.Value {
 		case *types.Pointer:
 			typeFields = []llvm.Value{
 				llvm.ConstInt(c.ctx.Int16Type(), uint64(numMethods), false), // numMethods
-				c.getTypeCode(typ.Elem()),
+				c.getTypeCode(typ.Elem()),                                   // elementType
+				c.getTypeMethodsListPtr(typ),                                // methods
 			}
 		case *types.Array:
 			typeFields = []llvm.Value{
@@ -357,6 +362,7 @@ func (c *compilerContext) getTypeCode(typ types.Type) llvm.Value {
 				llvm.ConstInt(c.ctx.Int16Type(), uint64(numMethods), false), // numMethods
 				c.getTypeCode(types.NewPointer(typ)),                        // ptrTo
 				pkgPathPtr,
+				c.getTypeMethodsListPtr(typ),                                     // methods
 				llvm.ConstInt(c.ctx.Int32Type(), uint64(size), false),            // size
 				llvm.ConstInt(c.ctx.Int16Type(), uint64(typ.NumFields()), false), // numFields
 			}
@@ -408,8 +414,10 @@ func (c *compilerContext) getTypeCode(typ types.Type) llvm.Value {
 			}
 			typeFields = append(typeFields, llvm.ConstArray(structFieldType, fields))
 		case *types.Interface:
-			typeFields = []llvm.Value{c.getTypeCode(types.NewPointer(typ))}
-			// TODO: methods
+			typeFields = []llvm.Value{
+				c.getTypeCode(types.NewPointer(typ)), // ptrTo
+				c.getTypeMethodsListPtr(typ),         // methods
+			}
 		case *types.Signature:
 			typeFields = []llvm.Value{c.getTypeCode(types.NewPointer(typ))}
 			// TODO: params, return values, etc
@@ -604,6 +612,68 @@ func getTypeCodeName(t types.Type) (string, bool) {
 	default:
 		panic("unknown type: " + t.String())
 	}
+}
+
+// getTypeMethodsList returns a pointer to a global list of the method
+// signatures available on typ, for use by the reflect package at runtime. The
+// list has the layout {uint16 numMethods, [numMethods]*i8 signatures} where
+// each signature is a pointer to the shared method signature global (see
+// getMethodSignature).
+//
+// Unlike the method set returned by getTypeMethodSet, which is prepended to the
+// type descriptor and stripped during interface lowering, this list is
+// referenced from an ordinary type descriptor field and therefore survives
+// lowering. Signature identity (pointer equality of the i8 globals) is
+// sufficient to determine whether two methods match: the signature name
+// encodes the method name, parameter and return types and — for unexported
+// methods — the package path.
+//
+// For interface types, the list contains the interface's declared methods
+// (including those from embedded interfaces). For non-interface types, it
+// contains the type's method set as computed by x/tools' MethodSets.
+func (c *compilerContext) getTypeMethodsList(typ types.Type) llvm.Value {
+	globalName := typ.String() + "$methodList"
+	global := c.mod.NamedGlobal(globalName)
+	if global.IsNil() {
+		var signatures []llvm.Value
+		if iface, ok := typ.Underlying().(*types.Interface); ok {
+			for i := 0; i < iface.NumMethods(); i++ {
+				signatures = append(signatures, c.getMethodSignature(iface.Method(i)))
+			}
+		} else {
+			ms := c.program.MethodSets.MethodSet(typ)
+			for i := 0; i < ms.Len(); i++ {
+				signatures = append(signatures, c.getMethodSignature(ms.At(i).Obj().(*types.Func)))
+			}
+		}
+
+		globalValue := c.ctx.ConstStruct([]llvm.Value{
+			llvm.ConstInt(c.ctx.Int16Type(), uint64(len(signatures)), false),
+			llvm.ConstArray(c.dataPtrType, signatures),
+		}, false)
+		global = llvm.AddGlobal(c.mod, globalValue.Type(), globalName)
+		global.SetInitializer(globalValue)
+		global.SetGlobalConstant(true)
+		global.SetUnnamedAddr(true)
+		global.SetLinkage(llvm.LinkOnceODRLinkage)
+	}
+	return global
+}
+
+// getTypeMethodsListPtr returns an LLVM value that is either a pointer to the
+// method signature list for typ or a null pointer when typ has no methods.
+// This is used to populate the "methods" field of a type descriptor.
+func (c *compilerContext) getTypeMethodsListPtr(typ types.Type) llvm.Value {
+	hasMethods := false
+	if iface, ok := typ.Underlying().(*types.Interface); ok {
+		hasMethods = iface.NumMethods() != 0
+	} else if c.program.MethodSets.MethodSet(typ).Len() != 0 {
+		hasMethods = true
+	}
+	if !hasMethods {
+		return llvm.ConstPointerNull(c.dataPtrType)
+	}
+	return c.getTypeMethodsList(typ)
 }
 
 // getTypeMethodSet returns a reference (GEP) to a global method set. This
