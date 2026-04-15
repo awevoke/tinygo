@@ -16,6 +16,14 @@ const (
 	valueFlagExported
 	valueFlagEmbedRO
 	valueFlagStickyRO
+	// valueFlagMethod marks a Value returned by Method or MethodByName.
+	// The typecode is the method's Func-kind signature but the value
+	// pointer still holds the receiver, so Kind-Func operations that
+	// dereference v.value as a funcHeader (IsNil, UnsafePointer, Pointer)
+	// would misbehave. The flag lets those methods return Go's method-
+	// value semantics (never nil) without needing to synthesize a
+	// funcHeader.
+	valueFlagMethod
 
 	valueFlagRO = valueFlagEmbedRO | valueFlagStickyRO
 )
@@ -229,6 +237,12 @@ func (v Value) IsNil() bool {
 	case Chan, Map, Ptr, UnsafePointer:
 		return v.pointer() == nil
 	case Func:
+		if v.flags&valueFlagMethod != 0 {
+			// Method values are bound to a receiver and are never nil, to
+			// match Go's semantics and to keep IsNil from dereferencing the
+			// receiver data as a funcHeader.
+			return false
+		}
 		if v.value == nil {
 			return true
 		}
@@ -241,6 +255,10 @@ func (v Value) IsNil() bool {
 		slice := (*sliceHeader)(v.value)
 		return slice.data == nil
 	case Interface:
+		if v.flags&valueFlagMethod != 0 {
+			// Bound method values are never nil.
+			return false
+		}
 		val := *(*interface{})(v.value)
 		return val == nil
 	default:
@@ -264,6 +282,13 @@ func (v Value) UnsafePointer() unsafe.Pointer {
 		slice := (*sliceHeader)(v.value)
 		return slice.data
 	case Func:
+		if v.flags&valueFlagMethod != 0 {
+			// Method values carry the receiver in v.value, not a
+			// funcHeader. Returning the receiver pointer here would be
+			// surprising; matching Go, return nil for now (Call on a
+			// method value is not yet implemented).
+			return nil
+		}
 		fn := (*funcHeader)(v.value)
 		if fn.Context != nil {
 			return fn.Context
@@ -2197,8 +2222,12 @@ func (v Value) MethodByName(name string) Value {
 
 // methodValue builds a Value representing a bound method. The receiver
 // identity (v) is preserved so that a future Call implementation can
-// dispatch; today only inspection (IsValid, Kind, Type) is supported.
+// dispatch; today only inspection (IsValid, Kind, Type, IsNil, IsZero) is
+// supported. valueFlagMethod is set so that Kind-Func operations that
+// would otherwise dereference v.value as a funcHeader know to handle the
+// method-value case specially.
 func methodValue(recv Value, rm RawMethod) Value {
+	flags := (recv.flags &^ valueFlagIndirect) | valueFlagMethod
 	if rm.MethodType == nil {
 		// No Func-kind descriptor is available (interface methods).
 		// Return a Value that is at least valid and reflects the receiver
@@ -2206,13 +2235,13 @@ func methodValue(recv Value, rm RawMethod) Value {
 		return Value{
 			typecode: recv.typecode,
 			value:    recv.value,
-			flags:    recv.flags &^ valueFlagIndirect,
+			flags:    flags,
 		}
 	}
 	return Value{
 		typecode: rm.MethodType,
 		value:    recv.value,
-		flags:    recv.flags &^ valueFlagIndirect,
+		flags:    flags,
 	}
 }
 

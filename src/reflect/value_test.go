@@ -713,6 +713,48 @@ func TestValueMethodByName(t *testing.T) {
 	if hidden.IsValid() {
 		t.Errorf(`MethodByName("valueMethod2") should be hidden`)
 	}
+
+	// Bound method values are never nil and never zero, matching Go's
+	// semantics. These used to reinterpret the receiver data as a
+	// funcHeader; the valueFlagMethod guard prevents that.
+	if m.IsNil() {
+		t.Errorf(`MethodByName("ValueMethod1").IsNil() = true, want false`)
+	}
+	if m.IsZero() {
+		t.Errorf(`MethodByName("ValueMethod1").IsZero() = true, want false`)
+	}
+}
+
+// TestTypeMethodOnInterface covers MethodByName on an interface type — Go's
+// reflect includes unexported methods in an interface's method set, unlike
+// concrete types, so this path has a separate code branch.
+type ifaceWithPrivate interface {
+	Public() int
+	private() int //nolint:unused
+}
+
+func TestTypeMethodOnInterface(t *testing.T) {
+	typ := TypeOf((*ifaceWithPrivate)(nil)).Elem()
+	if got := typ.NumMethod(); got != 2 {
+		t.Fatalf("interface NumMethod() = %d, want 2 (Public and private)", got)
+	}
+	m, ok := typ.MethodByName("Public")
+	if !ok {
+		t.Fatalf(`interface MethodByName("Public") not found`)
+	}
+	if m.Name != "Public" {
+		t.Errorf(`interface MethodByName("Public").Name = %q`, m.Name)
+	}
+	// Interface method entries expose a nil methodType in the list; reflect
+	// reports Method.Type as a nil Type (Method.Func is also nil) for
+	// interfaces, matching stdlib conventions.
+	m2, ok := typ.MethodByName("private")
+	if !ok {
+		t.Fatalf(`interface MethodByName("private") should be visible on interface types`)
+	}
+	if m2.Name != "private" {
+		t.Errorf(`interface MethodByName("private").Name = %q`, m2.Name)
+	}
 }
 
 func TestAssignableTo(t *testing.T) {
