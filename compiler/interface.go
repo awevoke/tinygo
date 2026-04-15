@@ -614,19 +614,21 @@ func getTypeCodeName(t types.Type) (string, bool) {
 	}
 }
 
-// getTypeMethodsList returns a pointer to a global list of the method
-// signatures available on typ, for use by the reflect package at runtime. The
-// list has the layout {uint16 numMethods, [numMethods]*i8 signatures} where
-// each signature is a pointer to the shared method signature global (see
-// getMethodSignature).
+// getTypeMethodsList returns a pointer to a global list of the methods
+// available on typ, for use by the reflect package at runtime. The list has
+// the layout {uint16 numMethods, [numMethods]{*i8 signature, *i8 methodType}}
+// where signature is a pointer to the shared method signature global (see
+// getMethodSignature) and methodType is a pointer to the type descriptor of
+// the method's function signature, or null for interface methods.
 //
 // Unlike the method set returned by getTypeMethodSet, which is prepended to the
 // type descriptor and stripped during interface lowering, this list is
 // referenced from an ordinary type descriptor field and therefore survives
-// lowering. Signature identity (pointer equality of the i8 globals) is
+// lowering. Signature identity (pointer equality of the signature globals) is
 // sufficient to determine whether two methods match: the signature name
 // encodes the method name, parameter and return types and — for unexported
-// methods — the package path.
+// methods — the package path. The methodType pointer lets reflect construct
+// a Func-kind Type for Method.Type / Value.MethodByName results.
 //
 // For interface types, the list contains the interface's declared methods
 // (including those from embedded interfaces). For non-interface types, it
@@ -635,21 +637,37 @@ func (c *compilerContext) getTypeMethodsList(typ types.Type) llvm.Value {
 	globalName := typ.String() + "$methodList"
 	global := c.mod.NamedGlobal(globalName)
 	if global.IsNil() {
-		var signatures []llvm.Value
+		entryType := c.ctx.StructType([]llvm.Type{c.dataPtrType, c.dataPtrType}, false)
+		var entries []llvm.Value
+		_, isIface := typ.Underlying().(*types.Interface)
+		nullPtr := llvm.ConstPointerNull(c.dataPtrType)
+		addEntry := func(m *types.Func) {
+			sig := c.getMethodSignature(m)
+			methodType := nullPtr
+			if !isIface {
+				// Emit a Func-kind type descriptor for the method's function
+				// signature so reflect can report Method.Type. We skip this
+				// for interface methods: their descriptors would need the
+				// receiver stripped, and reflect returns a nil Func anyway
+				// for interface methods.
+				methodType = c.getTypeCode(m.Type())
+			}
+			entries = append(entries, llvm.ConstNamedStruct(entryType, []llvm.Value{sig, methodType}))
+		}
 		if iface, ok := typ.Underlying().(*types.Interface); ok {
 			for i := 0; i < iface.NumMethods(); i++ {
-				signatures = append(signatures, c.getMethodSignature(iface.Method(i)))
+				addEntry(iface.Method(i))
 			}
 		} else {
 			ms := c.program.MethodSets.MethodSet(typ)
 			for i := 0; i < ms.Len(); i++ {
-				signatures = append(signatures, c.getMethodSignature(ms.At(i).Obj().(*types.Func)))
+				addEntry(ms.At(i).Obj().(*types.Func))
 			}
 		}
 
 		globalValue := c.ctx.ConstStruct([]llvm.Value{
-			llvm.ConstInt(c.ctx.Int16Type(), uint64(len(signatures)), false),
-			llvm.ConstArray(c.dataPtrType, signatures),
+			llvm.ConstInt(c.ctx.Int16Type(), uint64(len(entries)), false),
+			llvm.ConstArray(entryType, entries),
 		}, false)
 		global = llvm.AddGlobal(c.mod, globalValue.Type(), globalName)
 		global.SetInitializer(globalValue)
@@ -728,17 +746,22 @@ func (c *compilerContext) getMethodSignatureName(method *types.Func) string {
 	return globalName
 }
 
-// getMethodSignature returns a global variable which is a reference to an
-// external *i8 indicating the indicating the signature of this method. It is
-// used during the interface lowering pass.
+// getMethodSignature returns a global variable which is a reference to an i8
+// array holding the method's name (null-terminated). The global address is
+// still used as a unique identity token for the method signature by the
+// interface lowering pass and by reflect (pointer equality matches on name,
+// parameters, return types and — for unexported methods — package path, all
+// encoded into the global's symbol name). Storing the method name as the
+// content makes the name recoverable at runtime from the pointer, which is
+// how reflect.Type.MethodByName and reflect.Value.MethodByName look up
+// methods.
 func (c *compilerContext) getMethodSignature(method *types.Func) llvm.Value {
 	globalName := c.getMethodSignatureName(method)
 	signatureGlobal := c.mod.NamedGlobal(globalName)
 	if signatureGlobal.IsNil() {
-		// TODO: put something useful in these globals, such as the method
-		// signature. Useful to one day implement reflect.Value.Method(n).
-		signatureGlobal = llvm.AddGlobal(c.mod, c.ctx.Int8Type(), globalName)
-		signatureGlobal.SetInitializer(llvm.ConstInt(c.ctx.Int8Type(), 0, false))
+		initializer := c.ctx.ConstString(method.Name()+"\x00", false)
+		signatureGlobal = llvm.AddGlobal(c.mod, initializer.Type(), globalName)
+		signatureGlobal.SetInitializer(initializer)
 		signatureGlobal.SetLinkage(llvm.LinkOnceODRLinkage)
 		signatureGlobal.SetGlobalConstant(true)
 		signatureGlobal.SetAlignment(1)

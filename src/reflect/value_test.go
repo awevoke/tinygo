@@ -596,6 +596,125 @@ func TestTinyNumMethods(t *testing.T) {
 	}
 }
 
+// TestTypeMethodByName verifies that Type.Method and Type.MethodByName return
+// the correct metadata for concrete types — including that only exported
+// methods are reachable and that pointer-receiver methods are only in the
+// method set of *T.
+func TestTypeMethodByName(t *testing.T) {
+	vt := TypeOf(methodStruct{})
+	pt := TypeOf(&methodStruct{})
+
+	// Value type sees only the single exported value-receiver method.
+	if got := vt.NumMethod(); got != 1 {
+		t.Fatalf("methodStruct.NumMethod() = %d, want 1", got)
+	}
+	m0 := vt.Method(0)
+	if m0.Name != "ValueMethod1" {
+		t.Errorf("methodStruct.Method(0).Name = %q, want %q", m0.Name, "ValueMethod1")
+	}
+	if m0.PkgPath != "" {
+		t.Errorf("methodStruct.Method(0).PkgPath = %q, want \"\"", m0.PkgPath)
+	}
+	if m0.Index != 0 {
+		t.Errorf("methodStruct.Method(0).Index = %d, want 0", m0.Index)
+	}
+
+	if m, ok := vt.MethodByName("ValueMethod1"); !ok || m.Name != "ValueMethod1" {
+		t.Errorf(`vt.MethodByName("ValueMethod1") = (%+v, %v)`, m, ok)
+	}
+	// Pointer-receiver methods are NOT in the value type's method set.
+	if _, ok := vt.MethodByName("PointerMethod1"); ok {
+		t.Errorf(`vt.MethodByName("PointerMethod1") = ok, want missing`)
+	}
+	// Unexported methods are NOT surfaced via NumMethod/Method/MethodByName
+	// (they still exist for AssignableTo/Implements via the private list, but
+	// are hidden from the public reflect API to match Go's semantics).
+	if _, ok := vt.MethodByName("valueMethod2"); ok {
+		t.Errorf(`vt.MethodByName("valueMethod2") should be hidden`)
+	}
+	if _, ok := vt.MethodByName("DoesNotExist"); ok {
+		t.Errorf(`vt.MethodByName("DoesNotExist") should not be found`)
+	}
+
+	// Pointer type sees value methods (promoted) AND pointer methods.
+	if got := pt.NumMethod(); got != 3 {
+		t.Fatalf("(*methodStruct).NumMethod() = %d, want 3", got)
+	}
+	for _, name := range []string{"ValueMethod1", "PointerMethod1", "PointerMethod2"} {
+		m, ok := pt.MethodByName(name)
+		if !ok {
+			t.Errorf(`(*methodStruct).MethodByName(%q): not found`, name)
+			continue
+		}
+		if m.Name != name {
+			t.Errorf(`(*methodStruct).MethodByName(%q).Name = %q`, name, m.Name)
+		}
+	}
+	// Methods on pt must be walked in sorted order via Method(i).
+	for i := 0; i < pt.NumMethod(); i++ {
+		m := pt.Method(i)
+		if m.Index != i {
+			t.Errorf("(*methodStruct).Method(%d).Index = %d", i, m.Index)
+		}
+		if m.Name == "" {
+			t.Errorf("(*methodStruct).Method(%d).Name is empty", i)
+		}
+		if i > 0 {
+			prev := pt.Method(i - 1).Name
+			if prev >= m.Name {
+				t.Errorf("methods not in lexicographic order: %q >= %q", prev, m.Name)
+			}
+		}
+	}
+}
+
+// TestTypeMethodByNameNamed verifies MethodByName on a named non-struct type.
+func TestTypeMethodByNameNamed(t *testing.T) {
+	typ := TypeOf(MyStringer(0))
+	if got := typ.NumMethod(); got != 1 {
+		t.Fatalf("MyStringer.NumMethod() = %d, want 1", got)
+	}
+	m, ok := typ.MethodByName("String")
+	if !ok {
+		t.Fatalf(`MyStringer.MethodByName("String"): not found`)
+	}
+	if m.Name != "String" {
+		t.Errorf(`MyStringer.MethodByName("String").Name = %q`, m.Name)
+	}
+}
+
+// TestValueMethodByName verifies the primary fix for issue #3862: Value.Method
+// and Value.MethodByName no longer panic. A found method returns a valid
+// Value of Kind Func; an unknown name returns the zero Value.
+func TestValueMethodByName(t *testing.T) {
+	v := ValueOf(methodStruct{i: 42})
+
+	// No panic is the baseline requirement.
+	m := v.MethodByName("ValueMethod1")
+	if !m.IsValid() {
+		t.Fatalf(`MethodByName("ValueMethod1") returned invalid Value`)
+	}
+	if m.Kind() != Func {
+		t.Errorf(`MethodByName("ValueMethod1").Kind() = %v, want Func`, m.Kind())
+	}
+
+	if got := v.Method(0); !got.IsValid() {
+		t.Errorf(`Method(0) returned invalid Value`)
+	}
+
+	// Not found → zero Value, not a panic.
+	miss := v.MethodByName("DoesNotExist")
+	if miss.IsValid() {
+		t.Errorf(`MethodByName("DoesNotExist") should be invalid`)
+	}
+
+	// Unexported is hidden from Value.MethodByName too.
+	hidden := v.MethodByName("valueMethod2")
+	if hidden.IsValid() {
+		t.Errorf(`MethodByName("valueMethod2") should be hidden`)
+	}
+}
+
 func TestAssignableTo(t *testing.T) {
 	var a any
 	refa := ValueOf(&a).Elem()

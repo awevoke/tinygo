@@ -2164,12 +2164,56 @@ func (v Value) CallSlice(in []Value) []Value {
 	panic("unimplemented: (reflect.Value).CallSlice()")
 }
 
+// Method returns a Value that represents the i'th method of v. See
+// Type.Method for the indexing semantics. The returned Value has Kind Func
+// when a method type is available. The actual invocation (Call) of a method
+// value is not yet implemented; Call on the returned Value will panic with
+// the separate "unimplemented: (reflect.Value).Call()" message.
 func (v Value) Method(i int) Value {
-	panic("unimplemented: (reflect.Value).Method()")
+	if v.typecode == nil {
+		panic(&ValueError{Method: "reflect.Value.Method", Kind: Invalid})
+	}
+	rm, ok := v.typecode.RawMethodAt(i)
+	if !ok {
+		panic("reflect: Method index out of range")
+	}
+	return methodValue(v, rm)
 }
 
+// MethodByName returns a Value representing the method with the given name.
+// If no such method is found, the returned Value is the zero Value and
+// IsValid reports false. For consistency with Go, unexported method names
+// are not looked up on non-interface types.
 func (v Value) MethodByName(name string) Value {
-	panic("unimplemented: (reflect.Value).MethodByName()")
+	if v.typecode == nil {
+		return Value{}
+	}
+	rm, ok := v.typecode.RawMethodByName(name)
+	if !ok {
+		return Value{}
+	}
+	return methodValue(v, rm)
+}
+
+// methodValue builds a Value representing a bound method. The receiver
+// identity (v) is preserved so that a future Call implementation can
+// dispatch; today only inspection (IsValid, Kind, Type) is supported.
+func methodValue(recv Value, rm RawMethod) Value {
+	if rm.MethodType == nil {
+		// No Func-kind descriptor is available (interface methods).
+		// Return a Value that is at least valid and reflects the receiver
+		// type so IsValid reports true.
+		return Value{
+			typecode: recv.typecode,
+			value:    recv.value,
+			flags:    recv.flags &^ valueFlagIndirect,
+		}
+	}
+	return Value{
+		typecode: rm.MethodType,
+		value:    recv.value,
+		flags:    recv.flags &^ valueFlagIndirect,
+	}
 }
 
 func (v Value) Recv() (x Value, ok bool) {
