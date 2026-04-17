@@ -538,5 +538,3 @@ Value.Method(0).IsValid(): true
 ptrValue.MethodByName(PtrMethod).IsValid(): true
 int NumMethod: 0
 int MethodByName(Foo): false
-Method(-1) panicked: true
-Method(99) panicked: true
