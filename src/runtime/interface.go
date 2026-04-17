@@ -93,6 +93,12 @@ func interfaceTypeAssert(ok bool) {
 // Implemented in the internal/reflectlite package.
 func typeImplementsMethodSet(actualTypeNum, assertedMethodSet unsafe.Pointer) bool
 
+// methodSetLookup is a sentinel function. Its presence in the program signals
+// to the interface lowering pass that method name data must be preserved in
+// type descriptors (for reflect.Type.Method / MethodByName).
+// Implemented in the internal/reflectlite package.
+func methodSetLookup()
+
 // The following declarations are only used during IR construction. They are
 // lowered to inline IR in the interface lowering pass.
 // See compiler/interface-lowering.go for details.

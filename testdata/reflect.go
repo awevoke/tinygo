@@ -360,6 +360,9 @@ func main() {
 	println("\nv.Interface() method")
 	testInterfaceMethod()
 
+	println("\ntype method sets")
+	testMethodSets()
+
 	// Test reflect.DeepEqual.
 	var selfref1, selfref2 selfref
 	selfref1.x = &selfref1
@@ -806,4 +809,137 @@ func xorshift32(x uint32) uint32 {
 func randuint32() uint32 {
 	xorshift32State = xorshift32(xorshift32State)
 	return xorshift32State
+}
+
+type HasMethods struct {
+	Name string
+}
+
+func (h HasMethods) Len() int {
+	return len(h.Name)
+}
+
+func (h HasMethods) String() string {
+	return h.Name
+}
+
+// unexported method — should NOT appear in method set
+func (h HasMethods) hidden() {}
+
+// PtrMethod is only on the pointer receiver.
+func (h *HasMethods) PtrMethod() {}
+
+// Embedded type tests.
+type Inner struct{ X int }
+
+func (i Inner) InnerMethod() int { return i.X }
+
+type Outer struct {
+	Y int
+	Inner
+}
+
+func (o Outer) OuterMethod() int { return o.Y }
+
+// Interface type method set test.
+type Iface interface {
+	Alpha()
+	Beta()
+}
+
+func testMethodSets() {
+	// --- Struct value type: only value-receiver methods ---
+	t := reflect.TypeOf(HasMethods{})
+	println("struct NumMethod:", t.NumMethod())
+	for i := 0; i < t.NumMethod(); i++ {
+		m := t.Method(i)
+		println("struct Method:", m.Name)
+	}
+
+	// --- Pointer type: includes both value and pointer receiver methods ---
+	pt := reflect.TypeOf(new(HasMethods))
+	println("pointer NumMethod:", pt.NumMethod())
+	for i := 0; i < pt.NumMethod(); i++ {
+		m := pt.Method(i)
+		println("pointer Method:", m.Name)
+	}
+
+	// --- MethodByName: found and not found ---
+	m, ok := t.MethodByName("String")
+	println("MethodByName(String):", m.Name, ok)
+
+	m, ok = t.MethodByName("Len")
+	println("MethodByName(Len):", m.Name, ok)
+
+	_, ok = t.MethodByName("Nonexistent")
+	println("MethodByName(Nonexistent):", ok)
+
+	// MethodByName for pointer-only method on pointer type
+	m, ok = pt.MethodByName("PtrMethod")
+	println("pointer MethodByName(PtrMethod):", m.Name, ok)
+
+	// MethodByName for pointer-only method on value type → not found
+	_, ok = t.MethodByName("PtrMethod")
+	println("struct MethodByName(PtrMethod):", ok)
+
+	// --- Embedded types ---
+	ot := reflect.TypeOf(Outer{})
+	println("embedded NumMethod:", ot.NumMethod())
+	for i := 0; i < ot.NumMethod(); i++ {
+		m := ot.Method(i)
+		println("embedded Method:", m.Name)
+	}
+
+	// --- Interface type ---
+	ifaceT := reflect.TypeOf((*Iface)(nil)).Elem()
+	println("interface NumMethod:", ifaceT.NumMethod())
+	for i := 0; i < ifaceT.NumMethod(); i++ {
+		m := ifaceT.Method(i)
+		println("interface Method:", m.Name)
+	}
+
+	// --- Value.Method / Value.MethodByName ---
+	v := reflect.ValueOf(HasMethods{Name: "hello"})
+	mv := v.MethodByName("String")
+	println("Value.MethodByName(String).IsValid():", mv.IsValid())
+
+	mv = v.MethodByName("Nonexistent")
+	println("Value.MethodByName(Nonexistent).IsValid():", mv.IsValid())
+
+	// Value.Method by index
+	mv = v.Method(0)
+	println("Value.Method(0).IsValid():", mv.IsValid())
+
+	// Pointer value includes pointer receiver methods.
+	pv := reflect.ValueOf(&HasMethods{Name: "hello"})
+	mv = pv.MethodByName("PtrMethod")
+	println("ptrValue.MethodByName(PtrMethod).IsValid():", mv.IsValid())
+
+	// --- Types with no methods ---
+	noMethodT := reflect.TypeOf(42)
+	println("int NumMethod:", noMethodT.NumMethod())
+
+	_, ok = noMethodT.MethodByName("Foo")
+	println("int MethodByName(Foo):", ok)
+
+	// --- Out-of-range Method panics ---
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				println("Method(-1) panicked: true")
+			}
+		}()
+		t.Method(-1)
+		println("Method(-1) panicked: false")
+	}()
+
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				println("Method(99) panicked: true")
+			}
+		}()
+		t.Method(99)
+		println("Method(99) panicked: false")
+	}()
 }

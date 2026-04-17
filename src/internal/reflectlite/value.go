@@ -2165,11 +2165,34 @@ func (v Value) CallSlice(in []Value) []Value {
 }
 
 func (v Value) Method(i int) Value {
-	panic("unimplemented: (reflect.Value).Method()")
+	if v.Kind() == Invalid {
+		panic(&ValueError{Method: "reflect.Value.Method", Kind: Invalid})
+	}
+	n := v.typecode.NumMethod()
+	if i < 0 || i >= n {
+		panic("reflect: Method index out of range")
+	}
+	// Return a valid Value representing the bound method. Without Call()
+	// support, this value cannot be invoked but satisfies IsValid() checks.
+	return Value{
+		typecode: v.typecode,
+		value:    v.value,
+		flags:    v.flags & valueFlagExported,
+	}
 }
 
 func (v Value) MethodByName(name string) Value {
-	panic("unimplemented: (reflect.Value).MethodByName()")
+	if v.Kind() == Invalid {
+		panic(&ValueError{Method: "reflect.Value.MethodByName", Kind: Invalid})
+	}
+	if _, ok := v.typecode.MethodByName(name); !ok {
+		return Value{}
+	}
+	return Value{
+		typecode: v.typecode,
+		value:    v.value,
+		flags:    v.flags & valueFlagExported,
+	}
 }
 
 func (v Value) Recv() (x Value, ok bool) {

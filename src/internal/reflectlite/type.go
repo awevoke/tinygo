@@ -252,10 +252,18 @@ type structField struct {
 	data      unsafe.Pointer // various bits of information, packed in a byte array
 }
 
+// Method set entry, as emitted by the compiler. Each entry pairs a signature
+// identity pointer (for Implements/AssignableTo comparison) with a pointer to
+// the method's null-terminated name string.
+type methodEntry struct {
+	signature unsafe.Pointer
+	name      *byte
+}
+
 // Method set, as emitted by the compiler.
 type methodSet struct {
 	length  uintptr
-	methods [0]unsafe.Pointer // variable number of method signature pointers
+	methods [0]methodEntry
 }
 
 // Equivalent to (go/types.Type).Underlying(): if this is a named type return
@@ -805,8 +813,8 @@ func (t *RawType) Implements(u Type) bool {
 
 // typeImplementsMethodSet checks whether the concrete type (identified by its
 // typecode pointer) implements the given method set. Both the concrete type's
-// method set and the asserted method set are sorted arrays of method signature
-// pointers, so comparison is O(n+m).
+// method set and the asserted method set are sorted arrays of {signature, name}
+// entries, so comparison is O(n+m). Only the signature field is compared.
 //
 //go:linkname typeImplementsMethodSet runtime.typeImplementsMethodSet
 func typeImplementsMethodSet(concreteType, assertedMethodSet unsafe.Pointer) bool {
@@ -814,7 +822,7 @@ func typeImplementsMethodSet(concreteType, assertedMethodSet unsafe.Pointer) boo
 		return false
 	}
 
-	const ptrSize = unsafe.Sizeof((*byte)(nil))
+	const entrySize = unsafe.Sizeof(methodEntry{})
 	itfNumMethod := *(*uintptr)(assertedMethodSet)
 	if itfNumMethod == 0 {
 		return true
@@ -853,13 +861,14 @@ func typeImplementsMethodSet(concreteType, assertedMethodSet unsafe.Pointer) boo
 	}
 
 	concreteTypePtr := unsafe.Pointer(&methods.methods)
-	concreteTypeEnd := unsafe.Add(concreteTypePtr, uintptr(methods.length)*ptrSize)
+	concreteTypeEnd := unsafe.Add(concreteTypePtr, uintptr(methods.length)*entrySize)
 
 	// Iterate over each method in the interface method set, and check whether
 	// the method exists in the method set of the concrete type.
 	// Both method sets are sorted, so we can use a linear scan.
-	assertedTypePtr := unsafe.Add(assertedMethodSet, ptrSize)
-	assertedTypeEnd := unsafe.Add(assertedTypePtr, itfNumMethod*ptrSize)
+	// Each entry is a {signature, name} pair; we compare only the signature.
+	assertedTypePtr := unsafe.Add(assertedMethodSet, unsafe.Sizeof(uintptr(0)))
+	assertedTypeEnd := unsafe.Add(assertedTypePtr, itfNumMethod*entrySize)
 	for assertedTypePtr != assertedTypeEnd {
 		assertedMethod := *(*unsafe.Pointer)(assertedTypePtr)
 
@@ -868,13 +877,13 @@ func typeImplementsMethodSet(concreteType, assertedMethodSet unsafe.Pointer) boo
 				return false
 			}
 			concreteMethod := *(*unsafe.Pointer)(concreteTypePtr)
-			concreteTypePtr = unsafe.Add(concreteTypePtr, ptrSize)
+			concreteTypePtr = unsafe.Add(concreteTypePtr, entrySize)
 			if concreteMethod == assertedMethod {
 				break
 			}
 		}
 
-		assertedTypePtr = unsafe.Add(assertedTypePtr, ptrSize)
+		assertedTypePtr = unsafe.Add(assertedTypePtr, entrySize)
 	}
 
 	return true
@@ -921,6 +930,104 @@ func (t *RawType) NumMethod() int {
 	return 0
 }
 
+// getMethodSet returns the method set for a type, or nil if the type has no
+// inline method set.
+func (t *RawType) getMethodSet() *methodSet {
+	if t.isNamed() {
+		ct := (*namedType)(unsafe.Pointer(t))
+		if ct.numMethod&numMethodHasMethodSet == 0 {
+			return nil
+		}
+		return (*methodSet)(unsafe.Add(unsafe.Pointer(ct), unsafe.Sizeof(*ct)))
+	}
+	switch t.Kind() {
+	case Interface:
+		ct := (*interfaceType)(unsafe.Pointer(t.underlying()))
+		return &ct.methods
+	case Pointer:
+		ct := (*ptrType)(unsafe.Pointer(t))
+		if ct.numMethod&numMethodHasMethodSet == 0 {
+			return nil
+		}
+		return &ct.methods
+	case Struct:
+		ct := (*structType)(unsafe.Pointer(t))
+		if ct.numMethod&numMethodHasMethodSet == 0 {
+			return nil
+		}
+		fieldSize := unsafe.Sizeof(structField{})
+		methodsPtr := unsafe.Add(unsafe.Pointer(&ct.fields[0]), uintptr(ct.numField)*fieldSize)
+		return (*methodSet)(methodsPtr)
+	}
+	return nil
+}
+
+// methodSetEntry returns the i-th entry in the method set.
+func methodSetEntry(ms *methodSet, i int) *methodEntry {
+	return (*methodEntry)(unsafe.Add(unsafe.Pointer(&ms.methods), uintptr(i)*unsafe.Sizeof(methodEntry{})))
+}
+
+// Method returns the i-th method in the type's method set.
+//
+//go:linkname reflectTypeMethodByIndex reflect.(*rawType).Method
+func (t *RawType) Method(i int) MethodInfo {
+	methodSetLookup() // Ensure method name data is preserved.
+	n := t.NumMethod()
+	if i < 0 || i >= n {
+		panic("reflect: Method index out of range")
+	}
+	ms := t.getMethodSet()
+	if ms == nil || int(ms.length) <= i {
+		// Method set was pruned or stripped; name unavailable.
+		return MethodInfo{Index: i}
+	}
+	entry := methodSetEntry(ms, i)
+	name := readStringZ(unsafe.Pointer(entry.name))
+	return MethodInfo{
+		Name:  name,
+		Index: i,
+	}
+}
+
+// MethodByName returns the method with the given name in the type's method
+// set, and a boolean indicating if the method was found.
+//
+//go:linkname reflectTypeMethodByName reflect.(*rawType).MethodByName
+func (t *RawType) MethodByName(name string) (MethodInfo, bool) {
+	methodSetLookup() // Ensure method name data is preserved.
+	ms := t.getMethodSet()
+	if ms == nil {
+		return MethodInfo{}, false
+	}
+	n := int(ms.length)
+	for i := 0; i < n; i++ {
+		entry := methodSetEntry(ms, i)
+		ename := readStringZ(unsafe.Pointer(entry.name))
+		if ename == name {
+			return MethodInfo{
+				Name:  name,
+				Index: i,
+			}, true
+		}
+	}
+	return MethodInfo{}, false
+}
+
+// MethodInfo describes a single method. This is the internal reflectlite
+// representation; the reflect package wraps this in reflect.Method.
+type MethodInfo struct {
+	Name    string
+	PkgPath string
+	Index   int
+}
+
+// methodSetLookup is a sentinel function whose presence signals to the
+// interface lowering pass that method name data must be preserved.
+//
+//go:linkname methodSetLookup runtime.methodSetLookup
+//go:noinline
+func methodSetLookup() {}
+
 // Read and return a null terminated string starting from data.
 func readStringZ(data unsafe.Pointer) string {
 	start := data
@@ -942,8 +1049,8 @@ func (t *RawType) name() string {
 	ptr := unsafe.Add(unsafe.Pointer(ntype), unsafe.Sizeof(*ntype))
 	if ntype.numMethod&numMethodHasMethodSet != 0 {
 		ms := (*methodSet)(ptr)
-		// Skip past the length field and the method pointer entries.
-		ptr = unsafe.Add(ptr, unsafe.Sizeof(uintptr(0))+uintptr(ms.length)*unsafe.Sizeof(unsafe.Pointer(nil)))
+		// Skip past the length field and the method entries.
+		ptr = unsafe.Add(ptr, unsafe.Sizeof(uintptr(0))+uintptr(ms.length)*unsafe.Sizeof(methodEntry{}))
 	}
 	return readStringZ(ptr)
 }
