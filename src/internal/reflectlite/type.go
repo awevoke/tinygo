@@ -971,7 +971,6 @@ func methodSetEntry(ms *methodSet, i int) *methodEntry {
 //
 //go:linkname reflectTypeMethodByIndex reflect.(*rawType).Method
 func (t *RawType) Method(i int) MethodInfo {
-	methodSetLookup() // Ensure method name data is preserved.
 	n := t.NumMethod()
 	if i < 0 || i >= n {
 		panic("reflect: Method index out of range")
@@ -994,7 +993,6 @@ func (t *RawType) Method(i int) MethodInfo {
 //
 //go:linkname reflectTypeMethodByName reflect.(*rawType).MethodByName
 func (t *RawType) MethodByName(name string) (MethodInfo, bool) {
-	methodSetLookup() // Ensure method name data is preserved.
 	ms := t.getMethodSet()
 	if ms == nil {
 		return MethodInfo{}, false
@@ -1020,13 +1018,6 @@ type MethodInfo struct {
 	PkgPath string
 	Index   int
 }
-
-// methodSetLookup is a sentinel function whose presence signals to the
-// interface lowering pass that method name data must be preserved.
-//
-//go:linkname methodSetLookup runtime.methodSetLookup
-//go:noinline
-func methodSetLookup() {}
 
 // Read and return a null terminated string starting from data.
 func readStringZ(data unsafe.Pointer) string {

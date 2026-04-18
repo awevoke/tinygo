@@ -90,18 +90,19 @@ type interfaceInfo struct {
 // pass has been implemented as an object type because of its complexity, but
 // should be seen as a regular function call (see LowerInterfaces).
 type lowerInterfacesPass struct {
-	mod         llvm.Module
-	config      *compileopts.Config
-	builder     llvm.Builder
-	dibuilder   *llvm.DIBuilder
-	difiles     map[string]llvm.Metadata
-	ctx         llvm.Context
-	uintptrType llvm.Type
-	targetData  llvm.TargetData
-	ptrType     llvm.Type
-	types       map[string]*typeInfo
-	signatures  map[string]*signatureInfo
-	interfaces  map[string]*interfaceInfo
+	mod             llvm.Module
+	config          *compileopts.Config
+	builder         llvm.Builder
+	dibuilder       *llvm.DIBuilder
+	difiles         map[string]llvm.Metadata
+	ctx             llvm.Context
+	uintptrType     llvm.Type
+	targetData      llvm.TargetData
+	ptrType         llvm.Type
+	types           map[string]*typeInfo
+	signatures      map[string]*signatureInfo
+	interfaces      map[string]*interfaceInfo
+	keepMethodNames bool // true when Method/MethodByName are used
 }
 
 // LowerInterfaces lowers all intermediate interface calls and globals that are
@@ -342,15 +343,56 @@ func (p *lowerInterfacesPass) run() error {
 		stripMethodSets = true
 	}
 
-	// Check whether Method/MethodByName are used (via the sentinel
-	// function runtime.methodSetLookup). When they are, method sets must
-	// keep their name data and pruning must be disabled.
+	// Check whether Method/MethodByName are used by scanning invoke
+	// thunks for these method signatures. When they are, method sets
+	// must keep their name data and pruning must be disabled.
+	//
+	// We scan invoke thunks rather than checking the concrete
+	// implementations directly because reflect.Type includes
+	// Method/MethodByName in its interface, so those implementations
+	// are always compiled even when user code never calls them.
 	keepAllMethods := false
-	methodSetLookupFn := p.mod.NamedFunction("runtime.methodSetLookup")
-	if !methodSetLookupFn.IsNil() && hasUses(methodSetLookupFn) {
-		keepAllMethods = true
+	for _, fn := range interfaceInvokeFunctions {
+		invokeAttr := fn.GetStringAttributeAtIndex(-1, "tinygo-invoke")
+		sig := invokeAttr.GetStringValue()
+		if strings.HasPrefix(sig, "reflect/methods.Method(") || strings.HasPrefix(sig, "reflect/methods.MethodByName(") {
+			keepAllMethods = true
+			break
+		}
+	}
+	// Also check for direct calls to the concrete implementations
+	// from non-reflect code.
+	if !keepAllMethods {
+		for _, name := range []string{
+			"(*internal/reflectlite.RawType).Method",
+			"(*internal/reflectlite.RawType).MethodByName",
+		} {
+			fn := p.mod.NamedFunction(name)
+			if !fn.IsNil() && hasUses(fn) {
+				for use := fn.FirstUse(); !use.IsNil(); use = use.NextUse() {
+					user := use.User()
+					if !user.IsACallInst().IsNil() {
+						caller := user.InstructionParent().Parent().Name()
+						// The reflect and reflectlite packages have
+						// internal calls that are always present; only
+						// count calls from outside those packages.
+						if strings.Contains(caller, "reflect.") || strings.Contains(caller, "reflectlite.") {
+							continue
+						}
+						keepAllMethods = true
+						break
+					}
+				}
+			}
+			if keepAllMethods {
+				break
+			}
+		}
+	}
+	if keepAllMethods {
 		stripMethodSets = false // Method sets are needed.
 	}
+	p.keepMethodNames = keepAllMethods
 
 	// Collect all method signatures that appear in any interface type
 	// descriptor. When reflect is imported and method sets are kept,
@@ -457,6 +499,26 @@ func (p *lowerInterfacesPass) run() error {
 			t.typecode.EraseFromParentAsGlobal()
 			newGlobal.SetName(typecodeName)
 			t.typecode = newGlobal
+		} else if !keepAllMethods {
+			// Types without an external method set (e.g., interface types)
+			// may still have inline method sets with name pointers that
+			// should be nulled out when Method/MethodByName aren't used.
+			initializer := t.typecode.Initializer()
+			numFields := initializer.Type().StructElementTypesCount()
+			changed := false
+			var fields []llvm.Value
+			for i := 0; i < numFields; i++ {
+				field := p.builder.CreateExtractValue(initializer, i, "")
+				filtered := p.filterMethodSet(field, methodFilter, ifaceMethodSets)
+				if filtered.C != field.C {
+					changed = true
+				}
+				fields = append(fields, filtered)
+			}
+			if changed {
+				newInitializer := p.ctx.ConstStruct(fields, false)
+				t.typecode.SetInitializer(newInitializer)
+			}
 		}
 	}
 
@@ -784,14 +846,24 @@ func (p *lowerInterfacesPass) filterMethodSet(field llvm.Value, keepSigs map[str
 	}
 
 	// Prune: keep only method entries whose signature appears in keepSigs.
+	// When Method/MethodByName are not used, null out name pointers so
+	// LLVM can eliminate the name string globals.
 	var kept []llvm.Value
 	for _, e := range entries {
 		if _, ok := keepSigs[e.name]; ok {
-			kept = append(kept, e.pair)
+			if p.keepMethodNames {
+				kept = append(kept, e.pair)
+			} else {
+				sig := p.builder.CreateExtractValue(e.pair, 0, "")
+				kept = append(kept, p.ctx.ConstStruct([]llvm.Value{
+					sig,
+					llvm.ConstNull(p.ptrType),
+				}, false))
+			}
 		}
 	}
 
-	if len(kept) == numMethods {
+	if len(kept) == numMethods && p.keepMethodNames {
 		return field
 	}
 
