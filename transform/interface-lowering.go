@@ -363,6 +363,15 @@ func (p *lowerInterfacesPass) run() error {
 	// Also check for direct calls to the concrete implementations
 	// from non-reflect code.
 	if !keepAllMethods {
+		// Internal bridge functions that always call Method/MethodByName
+		// as part of the reflect package plumbing, even when user code
+		// never invokes them. We ignore calls from these functions.
+		internalCallers := map[string]struct{}{
+			"(*reflect.rawType).Method":       {},
+			"(*reflect.rawType).MethodByName": {},
+			"reflectTypeMethodByIndex":        {},
+			"reflectTypeMethodByName":         {},
+		}
 		for _, name := range []string{
 			"(*internal/reflectlite.RawType).Method",
 			"(*internal/reflectlite.RawType).MethodByName",
@@ -373,10 +382,7 @@ func (p *lowerInterfacesPass) run() error {
 					user := use.User()
 					if !user.IsACallInst().IsNil() {
 						caller := user.InstructionParent().Parent().Name()
-						// The reflect and reflectlite packages have
-						// internal calls that are always present; only
-						// count calls from outside those packages.
-						if strings.Contains(caller, "reflect.") || strings.Contains(caller, "reflectlite.") {
+						if _, ok := internalCallers[caller]; ok {
 							continue
 						}
 						keepAllMethods = true
@@ -453,10 +459,15 @@ func (p *lowerInterfacesPass) run() error {
 			}
 
 			var newInitializerFields []llvm.Value
+			numMethodFieldIdx := -1 // index into newInitializerFields
 			for i := 1; i < numFields; i++ {
 				field := p.builder.CreateExtractValue(initializer, i, "")
 				if !keepAllMethods {
 					field = p.filterMethodSet(field, methodFilter, ifaceMethodSets)
+				}
+				// Track where the numMethod field lands in the new slice.
+				if i == 2 && numMethodsIsI16 {
+					numMethodFieldIdx = len(newInitializerFields)
 				}
 				// Strip empty inline method sets for Named, Pointer, and
 				// Struct types. When the method set is pruned to empty, we
@@ -465,8 +476,10 @@ func (p *lowerInterfacesPass) run() error {
 				if numMethodsIsI16 && numMethodsConst&numMethodHasMethodSet != 0 && p.isMethodSetType(field.Type()) {
 					elems := field.Type().StructElementTypes()
 					if elems[1].ArrayLength() == 0 {
-						clearedNumMethods := numMethodsConst & ^uint64(numMethodHasMethodSet)
-						newInitializerFields[1] = llvm.ConstInt(p.ctx.Int16Type(), clearedNumMethods, false)
+						if numMethodFieldIdx >= 0 && numMethodFieldIdx < len(newInitializerFields) {
+							clearedNumMethods := numMethodsConst & ^uint64(numMethodHasMethodSet)
+							newInitializerFields[numMethodFieldIdx] = llvm.ConstInt(p.ctx.Int16Type(), clearedNumMethods, false)
+						}
 						continue
 					}
 				}

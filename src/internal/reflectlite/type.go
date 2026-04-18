@@ -922,8 +922,8 @@ func (t *RawType) NumMethod() int {
 	case Struct:
 		return int((*structType)(unsafe.Pointer(t)).numMethod & ^uint16(numMethodHasMethodSet))
 	case Interface:
-		//FIXME: Use len(methods)
-		return (*interfaceType)(unsafe.Pointer(t)).ptrTo.NumMethod()
+		ct := (*interfaceType)(unsafe.Pointer(t.underlying()))
+		return int(ct.methods.length)
 	}
 
 	// Other types have no methods attached.  Note we don't panic here.
@@ -967,7 +967,39 @@ func methodSetEntry(ms *methodSet, i int) *methodEntry {
 	return (*methodEntry)(unsafe.Add(unsafe.Pointer(&ms.methods), uintptr(i)*unsafe.Sizeof(methodEntry{})))
 }
 
+// isExportedMethod reports whether the method entry has an exported name.
+// Unexported method names are stored as "pkg/path.name" by the compiler,
+// so they always contain a dot. For interface types, all methods are
+// considered exported.
+func isExportedMethod(entry *methodEntry) bool {
+	if entry.name == nil {
+		return false // name was stripped by DCE
+	}
+	// Check first byte: exported Go identifiers start with A-Z.
+	return *entry.name >= 'A' && *entry.name <= 'Z'
+}
+
+// methodName returns the name and pkgPath of a method entry.
+// For exported methods, name is the method name and pkgPath is empty.
+// For unexported methods, name is just the method name and pkgPath is
+// the package path (stored as "pkg/path.name" by the compiler).
+func methodName(entry *methodEntry) (name, pkgPath string) {
+	if entry.name == nil {
+		return "", ""
+	}
+	full := readStringZ(unsafe.Pointer(entry.name))
+	// Unexported methods are stored as "pkg/path.name".
+	for i := len(full) - 1; i >= 0; i-- {
+		if full[i] == '.' {
+			return full[i+1:], full[:i]
+		}
+	}
+	return full, ""
+}
+
 // Method returns the i-th method in the type's method set.
+// For non-interface types, this indexes only exported methods.
+// For interface types, all methods are included.
 //
 //go:linkname reflectTypeMethodByIndex reflect.(*rawType).Method
 func (t *RawType) Method(i int) MethodInfo {
@@ -976,20 +1008,34 @@ func (t *RawType) Method(i int) MethodInfo {
 		panic("reflect: Method index out of range")
 	}
 	ms := t.getMethodSet()
-	if ms == nil || int(ms.length) <= i {
+	if ms == nil {
 		// Method set was pruned or stripped; name unavailable.
 		return MethodInfo{Index: i}
 	}
-	entry := methodSetEntry(ms, i)
-	name := readStringZ(unsafe.Pointer(entry.name))
-	return MethodInfo{
-		Name:  name,
-		Index: i,
+	isIface := t.Kind() == Interface
+	exportedIdx := 0
+	for j := 0; j < int(ms.length); j++ {
+		entry := methodSetEntry(ms, j)
+		if !isIface && !isExportedMethod(entry) {
+			continue
+		}
+		if exportedIdx == i {
+			name, pkgPath := methodName(entry)
+			return MethodInfo{
+				Name:    name,
+				PkgPath: pkgPath,
+				Index:   i,
+			}
+		}
+		exportedIdx++
 	}
+	// Method set was pruned; name unavailable.
+	return MethodInfo{Index: i}
 }
 
 // MethodByName returns the method with the given name in the type's method
 // set, and a boolean indicating if the method was found.
+// For non-interface types, only exported methods are searched.
 //
 //go:linkname reflectTypeMethodByName reflect.(*rawType).MethodByName
 func (t *RawType) MethodByName(name string) (MethodInfo, bool) {
@@ -997,16 +1043,22 @@ func (t *RawType) MethodByName(name string) (MethodInfo, bool) {
 	if ms == nil {
 		return MethodInfo{}, false
 	}
-	n := int(ms.length)
-	for i := 0; i < n; i++ {
-		entry := methodSetEntry(ms, i)
-		ename := readStringZ(unsafe.Pointer(entry.name))
+	isIface := t.Kind() == Interface
+	exportedIdx := 0
+	for j := 0; j < int(ms.length); j++ {
+		entry := methodSetEntry(ms, j)
+		if !isIface && !isExportedMethod(entry) {
+			continue
+		}
+		ename, pkgPath := methodName(entry)
 		if ename == name {
 			return MethodInfo{
-				Name:  name,
-				Index: i,
+				Name:    name,
+				PkgPath: pkgPath,
+				Index:   exportedIdx,
 			}, true
 		}
+		exportedIdx++
 	}
 	return MethodInfo{}, false
 }

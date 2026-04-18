@@ -16,6 +16,7 @@ const (
 	valueFlagExported
 	valueFlagEmbedRO
 	valueFlagStickyRO
+	valueFlagMethod // set when the Value represents a bound method
 
 	valueFlagRO = valueFlagEmbedRO | valueFlagStickyRO
 )
@@ -219,6 +220,9 @@ func (v Value) RawType() *RawType {
 }
 
 func (v Value) Kind() Kind {
+	if v.flags&valueFlagMethod != 0 {
+		return Func
+	}
 	return v.typecode.Kind()
 }
 
@@ -229,6 +233,9 @@ func (v Value) IsNil() bool {
 	case Chan, Map, Ptr, UnsafePointer:
 		return v.pointer() == nil
 	case Func:
+		if v.flags&valueFlagMethod != 0 {
+			return false // bound methods are never nil
+		}
 		if v.value == nil {
 			return true
 		}
@@ -264,6 +271,10 @@ func (v Value) UnsafePointer() unsafe.Pointer {
 		slice := (*sliceHeader)(v.value)
 		return slice.data
 	case Func:
+		if v.flags&valueFlagMethod != 0 {
+			// Bound method — no meaningful function pointer.
+			return v.value
+		}
 		fn := (*funcHeader)(v.value)
 		if fn.Context != nil {
 			return fn.Context
@@ -2173,11 +2184,12 @@ func (v Value) Method(i int) Value {
 		panic("reflect: Method index out of range")
 	}
 	// Return a valid Value representing the bound method. Without Call()
-	// support, this value cannot be invoked but satisfies IsValid() checks.
+	// support, this value cannot be invoked but satisfies IsValid() and
+	// Kind() == Func checks.
 	return Value{
 		typecode: v.typecode,
 		value:    v.value,
-		flags:    v.flags & valueFlagExported,
+		flags:    (v.flags & valueFlagExported) | valueFlagMethod,
 	}
 }
 
@@ -2191,7 +2203,7 @@ func (v Value) MethodByName(name string) Value {
 	return Value{
 		typecode: v.typecode,
 		value:    v.value,
-		flags:    v.flags & valueFlagExported,
+		flags:    (v.flags & valueFlagExported) | valueFlagMethod,
 	}
 }
 
