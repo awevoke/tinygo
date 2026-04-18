@@ -504,6 +504,9 @@ func (p *lowerInterfacesPass) run() error {
 			// may still have inline method sets with name pointers that
 			// should be nulled out when Method/MethodByName aren't used.
 			initializer := t.typecode.Initializer()
+			if initializer.Type().TypeKind() != llvm.StructTypeKind {
+				continue
+			}
 			numFields := initializer.Type().StructElementTypesCount()
 			changed := false
 			var fields []llvm.Value
