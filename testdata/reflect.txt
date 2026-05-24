@@ -530,7 +530,6 @@ blue gopher
 v.Interface() method
 kind: interface
 int 5
-reflect map interface key ok
 
 type method sets
 struct NumMethod: 2
@@ -563,3 +562,4 @@ MethodByName(hidden): false
 Method(String).IsExported(): true
 int NumMethod: 0
 int MethodByName(Foo): false
+reflect map interface key ok
